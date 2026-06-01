@@ -18,13 +18,21 @@ The `p()` function contains two vulnerabilities: an unbounded `gets()` call into
    level2@RainFall:~$ file level2 
    level2: setuid setgid ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), dynamically linked (uses shared libs), for GNU/Linux 2.6.24, BuildID[sha1]=0x0b5bb6cdcf572505f066c42f7be2fde7c53dc8bc, not stripped
 ```
+```bash 
+   $ checksec --file level2 
+   RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH      FILE
+   No RELRO        No canary found   NX disabled   No PIE          No RPATH   No RUNPATH   level2
+```
 
 Key observations:
 
 - setuid/setgid binary: successful exploitation escalates privileges
 - not stripped: function names are preserved, simplifying static analysis
 - dynamically linked: library functions resolved at runtime via PLT/GOT
-
+- NX disabled: the stack and heap are executable, meaning injected shellcode can run directly
+- ASLR off: addresses are fixed across runs, no need to leak or brute force memory layout
+- No stack canary: the saved return address can be overwritten without triggering any detection
+- No PIE: the binary is loaded at a fixed base address every time, making PLT/GOT addresses predictable
 
 ---
 
@@ -194,6 +202,9 @@ After overflow, `strdup()` copies the full input to the heap. The heap base on t
 ```
 
 The heap address `0x0804a008` passes the stack guard check (`0x0804... & 0xb0000000 = 0x00000000 ≠ 0xb0000000`).
+
+---
+
 
 ## 6. Key Takeaways
 
